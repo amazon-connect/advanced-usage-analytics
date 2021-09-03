@@ -1,3 +1,6 @@
+// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: MIT-0
+
 const s3 = new (require('aws-sdk')).S3();
 const response = require('cfn-response');
 const streamsHtmlKey = 'index.html';

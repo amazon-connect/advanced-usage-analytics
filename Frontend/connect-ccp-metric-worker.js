@@ -1,3 +1,6 @@
+// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: MIT-0
+
 var debug = false; //set debug to true to persist all submitted records locally in IndexDB
 var apiGatewayEndpoint;
 const postIntervalSeconds = 300; //change frequency in which worker sends completed contact records to API

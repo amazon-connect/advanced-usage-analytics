@@ -1,3 +1,6 @@
+// Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// SPDX-License-Identifier: MIT-0
+
 var instanceURL = document.currentScript.getAttribute('ccpUrl');
 var region = document.currentScript.getAttribute('region');
 var apiUrl = document.currentScript.getAttribute('apiGatewayUrl');
