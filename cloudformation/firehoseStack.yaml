@@ -1,0 +1,384 @@
+Parameters:
+  myBucketArn:
+    Description: the ARN of the destination of the call connection records delivered by firehose
+    Type: String
+  CcpUrl:
+    Description: the HTTPS URL of your Amazon Connect CCP
+    Type: String
+  storageDestinationS3:
+    Type: String
+    AllowedPattern: '(?!^(\d+\.)+\d+$)^(^([a-z0-9]|[a-z0-9][a-z0-9\-]*[a-z0-9])\.)*([a-z0-9]|[a-z0-9][a-z0-9\-]*[a-z0-9])([a-z0-9\-]+((\/))?)*([a-z0-9])+$'
+    ConstraintDescription: "Invalid storage destination"
+    Description: Storage bucket for saving events, contact trace records, and logs. Required.
+ 
+  
+
+Resources:
+  firehoses3policy: 
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      ManagedPolicyName: firehoseuploadtos3
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement: 
+          - Effect: Allow
+            Action: 
+              - 's3:AbortMultipartUpload'
+              - 's3:GetBucketLocation'
+              - 's3:GetObject'
+              - 's3:ListBucket'
+              - 's3:ListBucketMultipartUploads'
+              - 's3:PutObject'
+            Resource:
+              - !Ref myBucketArn
+              - !Join ['/', [!Ref myBucketArn, '*']]
+  
+  firehoserole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: callconnectionfirehoserole
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "firehose.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns: 
+        - !Ref firehoses3policy
+
+  
+  Firehose:
+    Type: 'AWS::KinesisFirehose::DeliveryStream'
+    Properties:
+      DeliveryStreamName: CallConnectionFirehose
+      DeliveryStreamType: DirectPut
+      S3DestinationConfiguration:
+        BucketARN: !Ref myBucketArn
+        Prefix: 'CCPStreams/'
+        RoleARN: !GetAtt firehoserole.Arn
+
+
+  apigwRolePolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties :
+      ManagedPolicyName: firehoseuploadapigw
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement: 
+          - Effect: Allow
+            Action: 
+              - 'firehose:PutRecord'
+            Resource:
+              - !GetAtt Firehose.Arn
+
+  apigwRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: apigwfirehoserole
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "apigateway.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns: 
+        - !Ref apigwRolePolicy
+
+  myRestApi:
+    Type : "AWS::ApiGateway::RestApi"
+    Properties :
+      Body:
+        swagger: "2.0"
+        info:
+          version: "2020-08-24T08:36:30Z"
+          title: "usageAnalytics"
+        basePath: "/prod"
+        schemes:
+        - "https"
+        paths:
+          /callconnections:
+            post:
+              produces:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "aws"
+                credentials: !GetAtt apigwRole.Arn
+                uri: !Join ["", ["arn:aws:apigateway:", !Ref "AWS::Region", ":firehose:action/PutRecord"]]
+                responses:
+                  default:
+                    statusCode: "200"
+                passthroughBehavior: "when_no_match"
+                httpMethod: "POST"
+            options:
+              consumes:
+              - "application/json"
+              produces:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+                    Access-Control-Allow-Methods:
+                      type: "string"
+                    Access-Control-Allow-Headers:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "mock"
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                requestTemplates:
+                  application/json: "{\"statusCode\": 200}"
+                passthroughBehavior: "when_no_match"
+        definitions:
+          Empty:
+            type: "object"
+            title: "Empty Schema"
+
+  apiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties: 
+      RestApiId: !Ref myRestApi
+      StageName: prod
+
+
+  LambdaIAMRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                Resource: !Sub 'arn:aws:s3:::${WebHostingS3Bucket}/*'
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                Resource: !Sub 'arn:aws:s3:::aws-contact-center-blog/*'
+              - Effect: Allow
+                Action:
+                  - 's3:ListBucket'
+                  - 's3:ListBucketVersions'
+                Resource: 
+                  - !Sub 'arn:aws:s3:::aws-contact-center-blog/*'
+                  - !Sub 'arn:aws:s3:::${WebHostingS3Bucket}/*'
+      ManagedPolicyArns: 
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        
+
+  CustomResourceLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Role: !GetAtt LambdaIAMRole.Arn
+      Handler: "index.handler"
+      Runtime: "nodejs12.x"
+      Code:
+        ZipFile: |
+          const s3 = new (require('aws-sdk')).S3();
+          const response = require('cfn-response');
+          const streamsHtmlKey = 'index.html';
+          const sourceBucket = 'aws-contact-center-blog';
+          const sourcePrefix = 'connect-diagnostics-customCCP';
+          const sourceObjectArray = ['connect-ccp-metric-worker.js','connect-streams-min.js','main.js','libphonenumber-js.min.js'];
+          exports.handler = async (event, context) => {
+              let HtmlFile = [
+                  '<!DOCTYPE html>',
+                  '<meta charset="UTF-8">',
+                  '<html>',
+                  '  <head>',
+                  '    <script type="text/javascript" src="connect-streams-min.js"></script>',
+                  '    <script type="text/javascript" src="libphonenumber-js.min.js"></script>',
+                  '  </head>',
+                  '  <body>',
+                  '    <div id=containerDiv style="width: 400px;height: 800px;"></div>',
+                  '  </body>'
+              ];
+              var result = {responseStatus: 'FAILED', responseData: {Data: 'Never updated'}};
+              try {
+                  console.log(`Received event with type ${event.RequestType}`);
+                  await checkPreconditions(event, context);   
+                  if(event.RequestType === 'Create' || event.RequestType === 'Update') {
+                      var lineToWrite = `<script src='main.js' apiGatewayUrl='${event.ResourceProperties.ApiGatewayUrl}' region='${event.ResourceProperties.Region}' ccpDomElement='containerDiv' ccpUrl='${event.ResourceProperties.CcpUrl}'></script>`
+                      HtmlFile.push(lineToWrite, '</html>');
+                      s3Result = await s3.upload({
+                          Key: streamsHtmlKey,
+                          Bucket: event.ResourceProperties.WebHostingS3Bucket,
+                          Body: HtmlFile.join("\n"),
+                          ContentType: 'text/html'
+                      }).promise();
+                      console.log(`Finished uploading HTML with result ${JSON.stringify(s3Result, 0, 4)}`);
+
+                      copyResult = await Promise.all(
+                          sourceObjectArray.map( async (object) => {
+                              s3Result = await s3.copyObject({
+                                  Bucket: event.ResourceProperties.WebHostingS3Bucket,
+                                  Key: object,
+                                  CopySource: `${sourceBucket}/${sourcePrefix}/${object}`
+                              }).promise();
+                              console.log(`Finished uploading File with result ${JSON.stringify(s3Result, 0, 4)}`);
+                          }),
+                      );
+                      
+                      result.responseStatus = 'SUCCESS';
+                      result.responseData['Data'] = 'Successfully uploaded files';
+                  } else if (event.RequestType === 'Delete') {
+                      var s3Result = await s3.deleteObjects({
+                          Delete: {
+                              Objects:[
+                                  {
+                                      Key: 'index.html'
+                                  }
+                              ],
+                              Quiet: false
+                          },
+                          Bucket: event.ResourceProperties.WebHostingS3Bucket
+                      }).promise();
+                      console.log(`Deletion result: ${s3Result}`)
+                      result.responseStatus = 'SUCCESS',
+                      result.responseData['Data'] = 'Successfully deleted files';
+                  }
+              } catch (error) {
+                  console.log(JSON.stringify(error, 0, 4));
+                  result.responseStatus = 'FAILED';
+                  result.responseData['Data'] = 'Failed to process event';
+              } finally {
+                  return await responsePromise(event, context, result.responseStatus, result.responseData, `StreamsAPIWebpage`);
+              }
+          };
+
+          function responsePromise(event, context, responseStatus, responseData, physicalResourceId) {
+              return new Promise(() => response.send(event, context, responseStatus, responseData, physicalResourceId));
+          }
+
+          function checkPreconditions(event) {
+              return new Promise( function (resolve, reject) {
+                  if( (event.ResourceProperties.ApiGatewayUrl && 
+                  event.ResourceProperties.WebHostingS3Bucket  &&
+                  event.ResourceProperties.CcpUrl  &&
+                  event.ResourceProperties.Region )){
+                      resolve(true);
+                  } else {
+                      console.log(`Missing properties on event. ${JSON.stringify(event, 0, 4)}`)
+                      reject(false);
+                  }
+              });
+          }
+      Timeout: 50
+
+
+  CloudFrontOAI:
+    Type: 'AWS::CloudFront::CloudFrontOriginAccessIdentity'
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Ref WebHostingS3Bucket
+
+  WebHostingS3Bucket:
+    Type: 'AWS::S3::Bucket'
+      #Need to upload files
+
+  CFReadPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref WebHostingS3Bucket
+      PolicyDocument:
+        Statement:
+        - Action: 's3:GetObject'
+          Effect: Allow
+          Resource: !Sub 'arn:aws:s3:::${WebHostingS3Bucket}/*'
+          Principal:
+            CanonicalUser: !GetAtt CloudFrontOAI.S3CanonicalUserId
+
+  CFDistro:
+    Type: 'AWS::CloudFront::Distribution'
+    DependsOn: WebHostingS3Bucket
+    Properties:
+      DistributionConfig:
+        DefaultRootObject: 'index.html'
+        Enabled: true
+        HttpVersion: http2
+        Origins:
+        - DomainName: !GetAtt 'WebHostingS3Bucket.DomainName'
+          Id: s3origin
+          S3OriginConfig:
+            OriginAccessIdentity: !Sub 'origin-access-identity/cloudfront/${CloudFrontOAI}'
+        PriceClass: 'PriceClass_All'
+        DefaultCacheBehavior:
+          AllowedMethods: 
+            - GET
+            - HEAD
+            - OPTIONS
+          TargetOriginId: s3origin
+          ViewerProtocolPolicy: allow-all
+          OriginRequestPolicyId: '88a5eaf4-2fd4-4709-b370-b4c650ea3fcf'
+          CachePolicyId: '4135ea2d-6df8-44a3-9df3-4b5a84be39ad'
+
+
+
+  LambdaTrigger:
+    Type: 'Custom::LambdaTrigger'
+    DependsOn: 
+      - LambdaInvokePermission
+      - CustomResourceLambdaFunction
+    Properties:
+      ServiceToken: !GetAtt CustomResourceLambdaFunction.Arn
+      ApiGatewayUrl: !Sub "https://${myRestApi}.execute-api.${AWS::Region}.amazonaws.com/prod/callconnections"
+      WebHostingS3Bucket: !Ref WebHostingS3Bucket 
+      CcpUrl: !Ref CcpUrl
+      Region: !Sub ${AWS::Region}
+      RequestToken: ${ClientRequestToken}
+
+  LambdaInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: lambda:InvokeFunction
+      Principal: !Ref 'AWS::AccountId'
+      FunctionName: !GetAtt CustomResourceLambdaFunction.Arn
+
+Outputs:
+  CloudfrontDistributionURL: 
+    Value: !Join 
+    - ''
+    - - 'https://'
+      - !GetAtt CFDistro.DomainName
+
+  APIURL:
+    Value: !Sub "https://${myRestApi}.execute-api.${AWS::Region}.amazonaws.com/prod/callconnections" 
+
+  FirehouseName:
+    Value: CallConnectionFirehose

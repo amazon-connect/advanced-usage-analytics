@@ -1,0 +1,738 @@
+Parameters:
+  ConnectionDataBucket:
+    Description: the ARN of the destination of the call connection records delivered by firehose
+    Type: String
+  CcpUrl:
+    Description: the HTTPS URL of your Amazon Connect CCP
+    Type: String
+  SamlUrl:
+    Description: The SAML URL for your instance. Leave empty if you aren't using SAML.
+    Type: String
+    Default: ''
+  ConnectGlueDatabase:
+    Type: String
+    Description: This is the glue catelog created in the backend stack
+  CreateStaticWebpage: 
+    AllowedValues: 
+      - 'true'
+      - 'false'
+    Default: 'true'
+    Description: "Select false if you have an existing custom CCP"
+    Type: String
+
+Conditions:
+  CreateStaticPageCondition: !Equals
+    - !Ref CreateStaticWebpage
+    - 'true'
+
+Resources:
+  firehoses3policy: 
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement: 
+          - Effect: Allow
+            Action: 
+              - 's3:AbortMultipartUpload'
+              - 's3:GetBucketLocation'
+              - 's3:GetObject'
+              - 's3:ListBucket'
+              - 's3:ListBucketMultipartUploads'
+              - 's3:PutObject'
+            Resource:
+              - !Sub 'arn:aws:s3:::${ConnectionDataBucket}'
+              - !Sub 'arn:aws:s3:::${ConnectionDataBucket}/*'
+          - Effect: Allow
+            Action:
+            - logs:PutLogEvents
+            - logs:CreateLogStream
+            Resource:
+            - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kinesisfirehose/*:log-stream:*
+          - Effect: Allow
+            Action:
+            - firehose:PutRecord
+            - firehose:PutRecordBatch
+            - firehose:UpdateDestination
+            Resource:
+            - !Sub arn:aws:firehose:${AWS::Region}:${AWS::AccountId}:deliverystream/*
+            
+  
+  firehoserole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "firehose.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns: 
+        - !Ref firehoses3policy
+
+  
+  Firehose:
+    Type: 'AWS::KinesisFirehose::DeliveryStream'
+    Properties:
+      DeliveryStreamName: CallConnectionFirehose
+      DeliveryStreamType: DirectPut
+      S3DestinationConfiguration:
+        BucketARN: !Sub 'arn:aws:s3:::${ConnectionDataBucket}'
+        Prefix: 'CCPStreams/'
+        RoleARN: !GetAtt firehoserole.Arn
+
+
+  apigwRolePolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties :
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement: 
+          - Effect: Allow
+            Action: 
+              - 'firehose:PutRecord'
+            Resource:
+              - !GetAtt Firehose.Arn
+
+  apigwRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "apigateway.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns: 
+        - !Ref apigwRolePolicy
+
+  myRestApi:
+    Type : "AWS::ApiGateway::RestApi"
+    Properties:
+      Body:
+        swagger: "2.0"
+        info:
+          version: "2020-08-24T08:36:30Z"
+          title: "usageAnalytics"
+        basePath: "/prod"
+        schemes:
+        - "https"
+        paths:
+          /callconnections:
+            post:
+              x-amazon-apigateway-request-validator : "Validatebody"
+              parameters:
+              - in: body
+                name: CCPModel
+                required: true
+                schema:
+                  type: object
+                  properties:
+                    DeliveryStreamName:
+                      type: string
+                    Record:
+                      type: object
+                      properties:
+                        Data:
+                          type: string
+                  required:
+                    - DeliveryStreamName
+                    - Record
+              produces:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "aws"
+                credentials: !GetAtt apigwRole.Arn
+                uri: !Join ["", ["arn:aws:apigateway:", !Ref "AWS::Region", ":firehose:action/PutRecord"]]
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                passthroughBehavior: "when_no_match"
+                httpMethod: "POST"
+            options:
+              consumes:
+              - "application/json"
+              produces:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+                    Access-Control-Allow-Methods:
+                      type: "string"
+                    Access-Control-Allow-Headers:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                type: "mock"
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                requestTemplates:
+                  application/json: "{\"statusCode\": 200}"
+                passthroughBehavior: "when_no_match"
+        definitions:
+          Empty:
+            type: "object"
+            title: "Empty Schema"
+        x-amazon-apigateway-request-validators:
+          Validatebody:
+            validateRequestParameters: false
+            validateRequestBody: true
+
+
+  apiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties: 
+      RestApiId: !Ref myRestApi
+      StageName: prod
+
+  LambdaIAMRole:
+    Condition: CreateStaticPageCondition
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                Resource: !Sub 'arn:aws:s3:::${WebHostingS3Bucket}/*'
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                Resource: !Sub 'arn:aws:s3:::aws-contact-center-blog/*'
+              - Effect: Allow
+                Action:
+                  - 's3:ListBucket'
+                  - 's3:ListBucketVersions'
+                Resource: 
+                  - !Sub 'arn:aws:s3:::aws-contact-center-blog/*'
+                  - !Sub 'arn:aws:s3:::${WebHostingS3Bucket}/*'
+      ManagedPolicyArns: 
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        
+
+  CustomResourceLambdaFunction:
+    Condition: CreateStaticPageCondition
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Role: !GetAtt LambdaIAMRole.Arn
+      Handler: "index.handler"
+      Runtime: "nodejs12.x"
+      Code:
+        ZipFile: |
+          const s3 = new (require('aws-sdk')).S3();
+          const response = require('cfn-response');
+          const streamsHtmlKey = 'index.html';
+          const sourceBucket = 'aws-contact-center-blog';
+          const sourcePrefix = 'usage-analytics';
+          const sourceObjectArray = ['connect-ccp-metric-worker.js','connect-streams-min.js','main.js','libphonenumber-js.min.js'];
+          exports.handler = async (event, context) => {
+              let HtmlFile = [
+                  '<!DOCTYPE html>',
+                  '<meta charset="UTF-8">',
+                  '<html>',
+                  '  <head>',
+                  '    <script type="text/javascript" src="connect-streams-min.js"></script>',
+                  '    <script type="text/javascript" src="libphonenumber-js.min.js"></script>',
+                  '  </head>',
+                  '  <body>',
+                  '    <div id=containerDiv style="width: 400px;height: 800px;"></div>',
+                  '  </body>'
+              ];
+              var result = {responseStatus: 'FAILED', responseData: {Data: 'Never updated'}};
+              try {
+                  console.log(`Received event with type ${event.RequestType}`);
+                  await checkPreconditions(event, context);   
+                  if(event.RequestType === 'Create' || event.RequestType === 'Update') {
+                      var lineToWrite = `<script src='main.js' apiGatewayUrl='${event.ResourceProperties.ApiGatewayUrl}' region='${event.ResourceProperties.Region}' ccpDomElement='containerDiv' ccpUrl='${event.ResourceProperties.CcpUrl}' samlUrl='${event.ResourceProperties.SamlUrl}'></script>`
+                      HtmlFile.push(lineToWrite, '</html>');
+                      s3Result = await s3.upload({
+                          Key: streamsHtmlKey,
+                          Bucket: event.ResourceProperties.WebHostingS3Bucket,
+                          Body: HtmlFile.join("\n"),
+                          ContentType: 'text/html'
+                      }).promise();
+                      console.log(`Finished uploading HTML with result ${JSON.stringify(s3Result, 0, 4)}`);
+
+                      copyResult = await Promise.all(
+                          sourceObjectArray.map( async (object) => {
+                              s3Result = await s3.copyObject({
+                                  Bucket: event.ResourceProperties.WebHostingS3Bucket,
+                                  Key: object,
+                                  CopySource: `${sourceBucket}/${sourcePrefix}/${object}`
+                              }).promise();
+                              console.log(`Finished uploading File with result ${JSON.stringify(s3Result, 0, 4)}`);
+                          }),
+                      );
+                      
+                      result.responseStatus = 'SUCCESS';
+                      result.responseData['Data'] = 'Successfully uploaded files';
+                  } else if (event.RequestType === 'Delete') {
+                      var s3Result = await s3.deleteObjects({
+                          Delete: {
+                              Objects:[
+                                  {
+                                      Key: 'index.html'
+                                  }
+                              ],
+                              Quiet: false
+                          },
+                          Bucket: event.ResourceProperties.WebHostingS3Bucket
+                      }).promise();
+                      console.log(`Deletion result: ${s3Result}`)
+                      result.responseStatus = 'SUCCESS',
+                      result.responseData['Data'] = 'Successfully deleted files';
+                  }
+              } catch (error) {
+                  console.log(JSON.stringify(error, 0, 4));
+                  result.responseStatus = 'FAILED';
+                  result.responseData['Data'] = 'Failed to process event';
+              } finally {
+                  return await responsePromise(event, context, result.responseStatus, result.responseData, `StreamsAPIWebpage`);
+              }
+          };
+
+          function responsePromise(event, context, responseStatus, responseData, physicalResourceId) {
+              return new Promise(() => response.send(event, context, responseStatus, responseData, physicalResourceId));
+          }
+
+          function checkPreconditions(event) {
+              return new Promise( function (resolve, reject) {
+                  if( (event.ResourceProperties.ApiGatewayUrl && 
+                  event.ResourceProperties.WebHostingS3Bucket  &&
+                  event.ResourceProperties.CcpUrl  &&
+                  event.ResourceProperties.Region )){
+                      resolve(true);
+                  } else {
+                      console.log(`Missing properties on event. ${JSON.stringify(event, 0, 4)}`)
+                      reject(false);
+                  }
+              });
+          }
+      Timeout: 50
+
+
+  CloudFrontOAI:
+    Condition: CreateStaticPageCondition
+    Type: 'AWS::CloudFront::CloudFrontOriginAccessIdentity'
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Ref WebHostingS3Bucket
+
+  WebHostingS3Bucket:
+    Condition: CreateStaticPageCondition
+    Type: 'AWS::S3::Bucket'
+    DeletionPolicy: Retain
+      #Need to upload files
+
+  CFReadPolicy:
+    Condition: CreateStaticPageCondition
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref WebHostingS3Bucket
+      PolicyDocument:
+        Statement:
+        - Action: 's3:GetObject'
+          Effect: Allow
+          Resource: !Sub 'arn:aws:s3:::${WebHostingS3Bucket}/*'
+          Principal:
+            CanonicalUser: !GetAtt CloudFrontOAI.S3CanonicalUserId
+
+  CFDistro:
+    Condition: CreateStaticPageCondition
+    Type: 'AWS::CloudFront::Distribution'
+    DependsOn: WebHostingS3Bucket
+    Properties:
+      DistributionConfig:
+        DefaultRootObject: 'index.html'
+        Enabled: true
+        HttpVersion: http2
+        Origins:
+        - DomainName: !GetAtt WebHostingS3Bucket.RegionalDomainName
+          Id: s3origin
+          S3OriginConfig:
+            OriginAccessIdentity: !Sub 'origin-access-identity/cloudfront/${CloudFrontOAI}'
+        PriceClass: 'PriceClass_All'
+        DefaultCacheBehavior:
+          AllowedMethods: 
+            - GET
+            - HEAD
+            - OPTIONS
+          TargetOriginId: s3origin
+          ViewerProtocolPolicy: allow-all
+          OriginRequestPolicyId: '88a5eaf4-2fd4-4709-b370-b4c650ea3fcf'
+          CachePolicyId: '4135ea2d-6df8-44a3-9df3-4b5a84be39ad'
+
+  LambdaTrigger:
+    Condition: CreateStaticPageCondition
+    Type: 'Custom::LambdaTrigger'
+    DependsOn: 
+      - LambdaInvokePermission
+      - CustomResourceLambdaFunction
+    Properties:
+      ServiceToken: !GetAtt CustomResourceLambdaFunction.Arn
+      ApiGatewayUrl: !Sub "https://${myRestApi}.execute-api.${AWS::Region}.amazonaws.com/prod/callconnections"
+      WebHostingS3Bucket: !Ref WebHostingS3Bucket 
+      CcpUrl: !Ref CcpUrl
+      SamlUrl: !Ref SamlUrl
+      Region: !Sub ${AWS::Region}
+      RequestToken: ${ClientRequestToken}
+
+  LambdaInvokePermission:
+    Condition: CreateStaticPageCondition
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: lambda:InvokeFunction
+      Principal: !Ref 'AWS::AccountId'
+      FunctionName: !GetAtt CustomResourceLambdaFunction.Arn
+  
+  CallConnectionsDataNamedQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref ConnectGlueDatabase
+      Description: "Generate table for Call Connections data"
+      Name: !Sub ${AWS::StackName}-callconnections
+      QueryString: !Sub >
+        CREATE EXTERNAL TABLE amazonconnect_ccpstream (
+        contactId string,
+        inbound string,
+        initialConnectionId string,
+        initialTimestamp string,
+        type string,
+        connections array<
+          struct<
+            id: string,
+            connectingTimestamp: string,
+            connectedTimestamp: string,
+            disconnectedTimestamp: string,
+            agentStatus: struct<
+              agentPreferences: string,
+              agentStates: array<string>,
+              dialableCountries: array<string>,
+              softPhoneEnabled: boolean,
+              extension: string,
+              name: string,
+              permissions: array<string>,
+              routingProfile: struct<
+                channelConcurrencyMap: struct<
+                  CHAT: int,
+                  VOICE: int
+                >,
+                defaultOutboundQueue: struct<
+                  name: string,
+                  queueARN: string,
+                  queueId: string
+                >,
+                name: string,
+                queues: array<
+                  struct<
+                    name: string,
+                    queueARN: string,
+                    queueId: string
+                  >
+                >,
+                routingProfileARN: string,
+                routingProfileId: string
+              >
+            >,
+            active: string,
+            endpoint: struct<
+                  agentLogin: string,
+                  endpointARN: string,
+                  endpointId: string,
+                  name: string,
+                  phoneNumber: string,
+                  queue: string,
+                  type: string
+            >,
+            endpointCountryIso: string,
+            history: array<
+              struct<
+                active: string,
+                status: string,
+                `timestamp`: string
+              >
+            >,
+            lastUpdate: string,
+            status: string,
+            type: string
+          >
+        >,
+        stageConnecting struct<
+          attributes: string,
+          queue: struct<
+                name: string,
+                queueARN: string,
+                queueId: string
+          >,
+          thirdPartyConnections: array<string>,
+          `timestamp`: string,
+          type: string
+        >,
+        stageConnected struct<
+          attributes: string,
+          queue: struct<
+                name: string,
+                queueARN: string,
+                queueId: string
+          >,
+          thirdPartyConnections: array<string>,
+          `timestamp`: string,
+          type: string
+        >,
+        stageEnded struct<
+          attributes: string,
+          queue: struct<
+                name: string,
+                queueARN: string,
+                queueId: string
+          >,
+          thirdPartyConnections: array<string>,
+          `timestamp`: string,
+          type: string
+        >,
+        stageError struct<
+          attributes: string,
+          queue: struct<
+                name: string,
+                queueARN: string,
+                queueId: string
+          >,
+          thirdPartyConnections: array<string>,
+          `timestamp`: string,
+          type: string
+        >
+        )  ROW FORMAT SERDE 'org.openx.data.jsonserde.JsonSerDe' LOCATION 's3://${ConnectionDataBucket}/CCPStreams/'
+
+
+  UsageReportAthenaNamedQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref ConnectGlueDatabase
+      Description: "Generate table for Call Connections data"
+      Name: !Sub ${AWS::StackName}-usagereport
+      QueryString: !Sub >
+        with streamsdata as (
+            with rawccpdataset as (
+                SELECT 
+                ccp.connections as con,
+                ccp.contactid,
+                ccp.inbound,
+                ccp.initialConnectionId,
+                ccp.initialTimestamp,
+                ccp.stageConnecting,
+                ccp.stageConnected,
+                ccp.stageEnded,
+                ccp.stageError
+                FROM "amazonconnect_ccpstream" ccp
+            ) 
+            SELECT  raw.contactid, 
+                    conns.id AS conn_id,  
+                    min(array_min(TRANSFORM(CAST(conns.history AS ARRAY<JSON>), x -> JSON_EXTRACT_SCALAR(x,'$[2]')))) AS initialconnecthistorytimestamp,
+                    arbitrary(conns.type) AS type, 
+                    arbitrary(conns.agentStatus).extension AS extension,
+                    arbitrary(conns.endpoint.type) AS endpoint_type,
+                    arbitrary(conns.endpoint.phonenumber) AS endpoint_number,
+                    bool_and(CAST(conns.agentStatus.softphoneEnabled AS boolean)) AS softphoneEnabled,
+                    bool_or(CAST(inbound AS boolean)) AS inbound,
+                    arbitrary(initialConnectionId) AS initialConnectionId,
+                    min(conns.connectingTimestamp) AS connectingTimestamp,
+                    min(conns.connectedTimestamp) AS connectedTimestamp,
+                    min(conns.disconnectedTimestamp) AS disconnectedTimestamp,
+                    arbitrary(conns.endpointCountryISO) AS endpointCountryISO
+            FROM rawccpdataset raw
+            CROSS JOIN unnest(con) AS t(conns)
+            GROUP BY contactid, conns.id
+            order by initialconnecthistorytimestamp ASC
+        ), 
+        ctrdata as (
+            select * from "amazonconnect_ctr" ctr
+        )
+        select 
+        ctrdata.awsaccountid,
+        ctrdata.instancearn,
+        ctrdata.channel,
+        ctrdata.queue.name as queue_name,
+        ctrdata.systemendpoint.address as system_endpoint,
+        ctrdata.contactid,
+        ctrdata.initialContactId,
+        ctrdata.customerendpoint.address as customer_endpoint,
+        streamsdata.conn_id as connection_id,
+        streamsdata.initialConnectionId,
+        streamsdata.type,
+        streamsdata.extension,
+        streamsdata.softphoneEnabled,
+        streamsdata.inbound,
+        streamsdata.connectingTimestamp,
+        streamsdata.connectedTimestamp,
+        streamsdata.disconnectedTimestamp,
+        streamsdata.endpointCountryISO,
+        ctrdata.Agent.ARN as AgentARN,
+        ctrdata.transferredtoendpoint as TransferEndpoint,
+        ctrdata.initiationmethod as Call_Initiation_Method,
+        ctrdata.InitiationTimestamp as CTR_Initiation_Timestamp,
+        ctrdata.Agent.ConnectedToAgentTimestamp as Connected_To_Agent_Timestamp,
+        ctrdata.DisconnectTimestamp as Disconnect_Timestamp,
+        ctrdata.ConnectedToSystemTimestamp as Connected_To_System_Timestamp,
+        ctrdata.TransferCompletedTimestamp as Transfer_Completed_Timestamp,
+        CASE
+            WHEN ((ctrdata.contactid = streamsdata.conn_id OR (streamsdata.conn_id IS NULL AND ctrdata.initialContactId IS NULL )) AND ctrdata.initiationmethod <> 'CALLBACK') THEN 
+                CAST(to_unixtime(from_iso8601_timestamp(ctrdata.DisconnectTimestamp)) AS INTEGER)-CAST(to_unixtime(from_iso8601_timestamp(ctrdata.InitiationTimestamp)) as INTEGER) 
+            WHEN ((ctrdata.contactid = streamsdata.conn_id) AND ctrdata.initiationmethod = 'CALLBACK') THEN 
+                CAST(to_unixtime(from_iso8601_timestamp(ctrdata.DisconnectTimestamp)) AS INTEGER)-CAST(to_unixtime(from_iso8601_timestamp(ctrdata.ConnectedToSystemTimestamp)) as INTEGER)
+            END AS Connect_Service_Seconds,
+
+        CASE (streamsdata.type = 'agent' AND streamsdata.softphoneEnabled = false)
+            WHEN true THEN 
+                CAST(
+                    CAST( to_unixtime(from_iso8601_timestamp(streamsdata.disconnectedTimestamp)) AS DECIMAL(20))-
+                    CAST( to_unixtime( from_iso8601_timestamp(streamsdata.connectedTimestamp) ) AS DECIMAL(20))
+                AS INTEGER )
+            END as AgentDeskPhone_Telco_inSeconds,
+
+        CASE  (streamsdata.type <> 'agent' AND streamsdata.contactid <> streamsdata.conn_id)
+            WHEN true THEN 
+                CASE (streamsdata.disconnectedTimestamp IS NOT NULL)
+                WHEN true THEN
+                    CAST(
+                        CAST( to_unixtime(from_iso8601_timestamp(streamsdata.disconnectedTimestamp)) AS DECIMAL(20))-
+                        CAST( to_unixtime( from_iso8601_timestamp(streamsdata.connectedTimestamp) ) AS DECIMAL(20))
+                    AS INTEGER )
+                ELSE
+                    CAST(
+                        CAST( to_unixtime(from_iso8601_timestamp(ctrdata.DisconnectTimestamp)) AS DECIMAL(20))-
+                        CAST( to_unixtime( from_iso8601_timestamp(ctrdata.TransferCompletedTimestamp) ) AS DECIMAL(20))
+                    AS INTEGER )
+                END
+            END AS Thirdparty_Telco_inSeconds,
+
+        CASE  (ctrdata.contactid = streamsdata.conn_id OR (streamsdata.conn_id IS NULL AND ctrdata.initialContactId IS NULL ))
+            WHEN true THEN
+                CAST(
+                    CAST( to_unixtime(from_iso8601_timestamp(ctrdata.DisconnectTimestamp)) AS DECIMAL(20))-
+                    CAST( to_unixtime( from_iso8601_timestamp(ctrdata.ConnectedToSystemTimestamp) ) AS DECIMAL(20))
+                    AS INTEGER )
+                END AS CustomerCallLength_Telco_inSeconds,
+        CASE  
+            WHEN ((ctrdata.contactid = streamsdata.conn_id OR (streamsdata.conn_id IS NULL AND ctrdata.initialContactId IS NULL )) AND ctrdata.initiationmethod <> 'CALLBACK') THEN 
+                CASE (CAST(to_unixtime(from_iso8601_timestamp(ctrdata.DisconnectTimestamp)) AS INTEGER)-CAST(to_unixtime(from_iso8601_timestamp(ctrdata.InitiationTimestamp)) as INTEGER) < 10)
+                WHEN true THEN 10
+                ELSE CAST(to_unixtime(from_iso8601_timestamp(ctrdata.DisconnectTimestamp)) AS INTEGER)-CAST(to_unixtime(from_iso8601_timestamp(ctrdata.InitiationTimestamp)) as INTEGER)
+                END
+            WHEN ((ctrdata.contactid = streamsdata.conn_id) AND ctrdata.initiationmethod = 'CALLBACK') THEN 
+                CASE (CAST(to_unixtime(from_iso8601_timestamp(ctrdata.DisconnectTimestamp)) AS INTEGER)-CAST(to_unixtime(from_iso8601_timestamp(ctrdata.ConnectedToSystemTimestamp)) as INTEGER) < 10)
+                WHEN true THEN 10
+                ELSE CAST(to_unixtime(from_iso8601_timestamp(ctrdata.DisconnectTimestamp)) AS INTEGER)-CAST(to_unixtime(from_iso8601_timestamp(ctrdata.ConnectedToSystemTimestamp)) as INTEGER)
+                END
+        END AS Connect_Service_Seconds_Rounded,
+        CASE (streamsdata.type = 'agent' AND streamsdata.softphoneEnabled = false)
+            WHEN true THEN 
+                CASE (CAST(to_unixtime(from_iso8601_timestamp(streamsdata.disconnectedTimestamp)) AS INTEGER)-CAST(to_unixtime(from_iso8601_timestamp(streamsdata.connectedTimestamp)) as INTEGER) < (60))            
+                WHEN true THEN CAST(60 AS INTEGER)            
+                ELSE CAST(
+                    CAST( to_unixtime(from_iso8601_timestamp(streamsdata.disconnectedTimestamp)) AS DECIMAL(20))-
+                    CAST( to_unixtime( from_iso8601_timestamp(streamsdata.connectedTimestamp) ) AS DECIMAL(20))
+                    AS INTEGER )
+                END
+        END as AgentDeskPhone_Telco_inSeconds_Rounded,
+        CASE  (streamsdata.type <> 'agent' AND streamsdata.contactid <> streamsdata.conn_id)
+            WHEN true THEN 
+                CASE (streamsdata.disconnectedTimestamp IS NOT NULL)
+                WHEN true THEN
+                    CASE (CAST(to_unixtime(from_iso8601_timestamp(streamsdata.disconnectedTimestamp)) AS INTEGER)-CAST(to_unixtime(from_iso8601_timestamp(streamsdata.connectedTimestamp)) as INTEGER) < (60))            
+                    WHEN true THEN CAST(60 AS INTEGER)            
+                    ELSE CAST(
+                        CAST( to_unixtime(from_iso8601_timestamp(streamsdata.disconnectedTimestamp)) AS DECIMAL(20))-
+                        CAST( to_unixtime( from_iso8601_timestamp(streamsdata.connectedTimestamp) ) AS DECIMAL(20))
+                        AS INTEGER )
+                    END
+                ELSE 
+                    CASE (CAST(to_unixtime(from_iso8601_timestamp(ctrdata.DisconnectTimestamp)) AS INTEGER)-CAST(to_unixtime(from_iso8601_timestamp(ctrdata.TransferCompletedTimestamp)) as INTEGER) < (60))            
+                    WHEN true THEN CAST(60 AS INTEGER)            
+                    ELSE CAST(
+                        CAST( to_unixtime(from_iso8601_timestamp(ctrdata.DisconnectTimestamp)) AS DECIMAL(20))-
+                        CAST( to_unixtime( from_iso8601_timestamp(ctrdata.TransferCompletedTimestamp) ) AS DECIMAL(20))
+                        AS INTEGER )
+                    END
+                END
+        END AS Thirdparty_Telco_inSeconds_Rounded,
+        CASE  (ctrdata.contactid = streamsdata.conn_id OR (streamsdata.conn_id IS NULL AND ctrdata.initialContactId IS NULL ))
+            WHEN true THEN
+                CASE (CAST(to_unixtime(from_iso8601_timestamp(ctrdata.DisconnectTimestamp)) AS INTEGER)-CAST(to_unixtime(from_iso8601_timestamp(ctrdata.ConnectedToSystemTimestamp)) as INTEGER) < (60))            
+                WHEN true THEN CAST(60 AS INTEGER)            
+                ELSE CAST(
+                    CAST( to_unixtime(from_iso8601_timestamp(ctrdata.DisconnectTimestamp)) AS DECIMAL(20))-
+                    CAST( to_unixtime( from_iso8601_timestamp(ctrdata.ConnectedToSystemTimestamp) ) AS DECIMAL(20))
+                    AS INTEGER )
+                END
+        END AS CustomerCallLength_Telco_inSeconds_Rounded
+        FROM ctrdata
+        LEFT JOIN streamsdata
+        ON streamsdata.contactid = ctrdata.contactid
+        WHERE channel = 'VOICE'
+        ORDER BY CTR_Initiation_Timestamp DESC        
+
+Outputs:
+  CloudfrontDistributionURL: 
+    Condition: CreateStaticPageCondition
+    Value: !Join 
+    - ''
+    - - 'https://'
+      - !GetAtt CFDistro.DomainName
+
+  APIURL:
+    Value: !Sub "https://${myRestApi}.execute-api.${AWS::Region}.amazonaws.com/prod/callconnections" 
+
+  CallConnectionsDataNamedQuery:
+    Description: Creates Athena table based on the connection level data.
+    Value: !Join
+    - ''
+    - - !Sub 'https://console.aws.amazon.com/athena/home?force&region=${AWS::Region}'
+      - '#query/saved/'
+      - !Ref CallConnectionsDataNamedQuery
+
+  UsageReportAthenaNamedQuery:
+    Description: Creates Athena query for analyzing call times and phone type for usage analytics.
+    Value: !Join
+    - ''
+    - - !Sub 'https://console.aws.amazon.com/athena/home?force&region=${AWS::Region}'
+      - '#query/saved/'
+      - !Ref UsageReportAthenaNamedQuery

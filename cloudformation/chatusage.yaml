@@ -1,0 +1,274 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  Sample template to illustrate use of existing S3 bucket as an event source for a Lambda function
+Parameters:
+  ConnectChatTranscriptBucket:
+    Type: String
+    Description: S3 bucket that's used for the Lambda event notification
+  TranscriptBucketPrefix:
+    Type: String
+    Description: Prefix for the s3 bucket that contains the transcript
+  ConnectGlueDatabase:
+    Type: String
+    Description: This is the glue catelog created in the backend stack
+
+Resources:
+  ProcessTranscriptLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        ZipFile: |
+            import json
+            import boto3
+            from urllib.parse import unquote
+            def lambda_handler(event, context):
+                # TODO implement
+                bucket_name = event['Records'][0]['s3']['bucket']['name']
+                key_value = event['Records'][0]['s3']['object']['key']
+                s3 = boto3.resource('s3')
+                key_value = unquote(key_value)
+                obj = s3.Object(bucket_name, key_value)
+                body = json.loads(obj.get()['Body'].read())
+                
+                results = {"system_msg": 0, "customer_msg": 0, "agent_msg":0 } 
+                for item in body['Transcript']:
+                    if item['Type'] == "MESSAGE":
+                        if item['ParticipantRole'] == "SYSTEM":
+                            results['system_msg'] += 1
+                        elif item['ParticipantRole'] == "CUSTOMER":
+                            results['customer_msg'] +=1
+                        elif item['ParticipantRole'] == "AGENT":
+                            results['agent_msg'] +=1
+                
+                results['total_msg'] = results['system_msg'] + results['customer_msg'] + results['agent_msg']
+                results['contactId'] = body['ContactId']
+                results['instanceId'] = body['InstanceId']
+                print(results)
+                
+                #need to put results to s3.
+                
+                result_object = s3.Object(bucket_name, 'chatusage/results_'+key_value)
+                result_object.put(Body=json.dumps(results))
+                
+                
+                return {
+                    'statusCode': 200,
+                    'body': json.dumps('Hello from Lambda!')
+                }
+
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaIAMRole.Arn
+      Runtime: python3.6
+      Timeout: 5
+
+  LambdaInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !GetAtt ProcessTranscriptLambda.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: !Sub 'arn:aws:s3:::${ConnectChatTranscriptBucket}'
+
+  LambdaIAMRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetBucketNotification'
+                  - 's3:PutBucketNotification'
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                Resource: 
+                  - !Sub 'arn:aws:s3:::${ConnectChatTranscriptBucket}/*'
+                  - !Sub 'arn:aws:s3:::${ConnectChatTranscriptBucket}'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource:
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*:log-stream:*
+
+  CustomResourceLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaIAMRole.Arn
+      Code:
+        ZipFile: |
+
+            from __future__ import print_function
+            import json
+            import boto3
+            import cfnresponse
+            
+            SUCCESS = "SUCCESS"
+            FAILED = "FAILED"
+            
+            print('Loading function')
+            client = boto3.client('s3')
+            
+            def lambda_handler(event, context):
+                print("Received event: " + json.dumps(event, indent=2))
+                responseData={}
+                try:
+                    if event['RequestType'] == 'Delete':
+                        print("Request Type:",event['RequestType'])
+                        Bucket=event['ResourceProperties']['Bucket']
+                        Prefix=event['ResourceProperties']['Prefix']
+                        delete_notification(Bucket)
+                        print("Sending response to custom resource after Delete")
+                    elif event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                        print("Request Type:",event['RequestType'])
+                        LambdaArn=event['ResourceProperties']['LambdaArn']
+                        Bucket=event['ResourceProperties']['Bucket']
+                        Prefix=event['ResourceProperties']['Prefix']
+                        ManualConfigRequired=add_notification(LambdaArn, Bucket, Prefix)
+                        responseData={'Bucket':Bucket, 'ManualConfigRequired':ManualConfigRequired}
+                        print("Sending response to custom resource")
+                    responseStatus = 'SUCCESS'
+                except Exception as e:
+                    print('Failed to process:', e)
+                    responseStatus = 'FAILED'
+                    responseData = {'Failure': 'Something bad happened.'}
+                cfnresponse.send(event, context, responseStatus, responseData)
+
+            def add_notification(LambdaArn, Bucket, Prefix):
+                response = client.get_bucket_notification_configuration(
+                    Bucket=Bucket
+                )
+                response.pop('ResponseMetadata', None)
+                notification_config = {
+                    'LambdaFunctionArn': LambdaArn,
+                    'Events': [
+                        's3:ObjectCreated:*'
+                    ],
+                    'Filter': {
+                        'Key': {
+                            'FilterRules': [
+                                {
+                                    'Name': 'prefix',
+                                    'Value': Prefix
+                                },
+                            ]
+                        }
+                    }
+                }
+                if response.get('LambdaFunctionConfigurations') is None:
+                    response['LambdaFunctionConfigurations'] = [notification_config]
+                else:
+                    response['LambdaFunctionConfigurations'].append(notification_config)
+                try:
+                    response_notification = client.put_bucket_notification_configuration(
+                        Bucket=Bucket,
+                        NotificationConfiguration=response
+                    )
+                    return "False"
+                except:
+                    print("Please manually configure.... ")
+                    return "True"
+
+                print("Put request completed....")
+              
+            def delete_notification(Bucket):
+                # bucket_notification = s3.BucketNotification(Bucket)
+                # response = bucket_notification.put(
+                #     NotificationConfiguration={}
+                # )
+                print("Please delete notification manually....")
+      Runtime: python3.6
+      Timeout: 50
+
+  LambdaTrigger:
+    Type: 'Custom::LambdaTrigger'
+    DependsOn: LambdaInvokePermission
+    Properties:
+      ServiceToken: !GetAtt CustomResourceLambdaFunction.Arn
+      LambdaArn: !GetAtt ProcessTranscriptLambda.Arn
+      Bucket: !Ref ConnectChatTranscriptBucket
+      Prefix: !Ref TranscriptBucketPrefix
+
+  ChatDetailsAthenaNamedQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref ConnectGlueDatabase
+      Description: "Generate table for chat transcript data"
+      Name: !Sub ${AWS::StackName}-chat-transcript
+      QueryString: !Sub >
+        CREATE EXTERNAL TABLE IF NOT EXISTS amazonconnect_chat (
+          `instanceId` string,
+          `contactId` string,
+          `system_msg` int,
+          `customer_msg` int,
+          `agent_msg` int,
+          `total_msg` int 
+        )
+        ROW FORMAT SERDE 'org.openx.data.jsonserde.JsonSerDe'
+        WITH SERDEPROPERTIES (
+          'serialization.format' = '1'
+        ) LOCATION 's3://${ConnectChatTranscriptBucket}/chatusage/'
+
+  ChatUsageReportAthenaNamedQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref ConnectGlueDatabase
+      Description: "Generates the chat usage report"
+      Name: !Sub ${AWS::StackName}-chat-usage
+      QueryString: !Sub >
+        select 
+        chatusage.instanceid,
+        ctr.queue.name,
+        ctr.ContactId,
+        ctr.channel,
+        ctr.InitiationTimestamp as CallInitiationTimestamp,
+        ctr.Agent.ConnectedToAgentTimestamp as ConnectedToAgentTimestamp,
+        ctr.DisconnectTimestamp as DisconnectTimestamp,
+        ctr.ConnectedToSystemTimestamp as ConnectedToSystemTimestamp,
+        chatusage.system_msg as ChatUsageSystemMsg,
+        chatusage.customer_msg as ChatUsageCustomerMsg,
+        chatusage.agent_msg as ChatUsageAgentMsg,
+        chatusage.total_msg as ChatUsageTotalMsg
+
+        FROM "amazonconnect_chat" chatusage 
+        LEFT JOIN "amazonconnect_ctr" ctr
+        ON ctr.ContactId = chatusage.contactid 
+        WHERE ctr.channel = 'CHAT'
+
+
+
+
+Outputs:
+  NeedManualConfigNotification: 
+    Value: !GetAtt LambdaTrigger.ManualConfigRequired
+
+  ChatDetailsAthenaNamedQuery:
+      Description: Creates Athena table for chat transcript details.
+      Value: !Join
+      - ''
+      - - !Sub 'https://console.aws.amazon.com/athena/home?force&region=${AWS::Region}'
+        - '#query/saved/'
+        - !Ref ChatDetailsAthenaNamedQuery
+
+  ChatUsageReportAthenaNamedQuery:
+      Description: Creates Athena query for chat usage analytics report
+      Value: !Join
+      - ''
+      - - !Sub 'https://console.aws.amazon.com/athena/home?force&region=${AWS::Region}'
+        - '#query/saved/'
+        - !Ref ChatUsageReportAthenaNamedQuery

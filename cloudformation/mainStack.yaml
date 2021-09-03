@@ -1,0 +1,311 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: "Main stack for the advanced analytics solution, this stack has the option to launch three nested stacks"
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Backend Stack"
+        Parameters:
+           - storageDestinationS3
+      - Label:
+          default: "Frontend Stack"
+        Parameters:
+          - EnableFrontendStack
+          - CreateStaticWebpage
+          - ConnectionDataBucket
+          - CcpUrl
+          - SamlUrl
+      - Label:
+          default: "Chat Usage Stack"
+        Parameters:
+          - EnableChatUsageStack
+          - ConnectChatTranscriptBucket
+          - TranscriptBucketPrefix
+
+    ParameterLabels:
+      storageDestinationS3:
+        default: Backend storage S3 Bucket 
+      EnableFrontendStack:
+        default: Deploy frontend stack
+      CreateStaticWebpage:
+        default: Deploy a custom call control panel
+      ConnectionDataBucket:
+        default: S3 Bucket to store call connections data
+
+
+Parameters:
+  # Frontend Parameters
+  EnableFrontendStack: 
+    AllowedValues: 
+      - 'true'
+      - 'false'
+    Default: 'true'
+    Description: "If this parameter is set as true it will deploy the frontend stack."
+    Type: String
+  CreateStaticWebpage: 
+    AllowedValues: 
+      - 'true'
+      - 'false'
+    Default: 'true'
+    Description: "Select false if you have an existing custom CCP."
+    Type: String
+  ConnectionDataBucket:
+    Description: The name of the Amazon S3 bucket to store the call connection data captured by the frontend and delivered by firehose. This can be the same bucket as the Backend storage S3 Bucket. 
+    Type: String
+  CcpUrl:
+    Description: The HTTPS URL of your Amazon Connect CCP, in the form of https:{Instance Name}.awsapps.com/connect/ccp-v2
+    # AllowedPattern: '\bhttps:\/\/(?:.)+?\.awsapps\.com\/connect\/ccp\-v2\b'
+    Type: String
+
+  SamlUrl:
+    Description: The SAML login URL for your instance. Please leave empty if you aren't using SAML.
+    Type: String
+    Default: ''
+
+  # Chat Usage Parameters
+  EnableChatUsageStack: 
+    AllowedValues: 
+      - 'true'
+      - 'false'
+    Default: 'true'
+    Description: "If true deploy chat usage stack"
+    Type: String
+
+  ConnectChatTranscriptBucket:
+    Type: String
+    Description: The S3 bucket where your chat transcripts are stored, for example connect-aaaxxxxxxxx
+  TranscriptBucketPrefix:
+    Type: String
+    Description: The prefix inside the S3 bucket where your transcript are stored, for example connect/instanceName/ChatTranscripts
+
+  # Backend stack parameters
+  storageDestinationS3:
+    Type: String
+    AllowedPattern: '(?!^(\d+\.)+\d+$)^(^([a-z0-9]|[a-z0-9][a-z0-9\-]*[a-z0-9])\.)*([a-z0-9]|[a-z0-9][a-z0-9\-]*[a-z0-9])([a-z0-9\-]+((\/))?)*([a-z0-9])+$'
+    ConstraintDescription: "Invalid storage destination"
+    Description: Required. The name of your Amazon S3 bucket to store contact trace records. You can create a new bucket or use an existing bucket.  
+
+Conditions:
+  EnableFrontendStackCondition: !Equals
+    - !Ref EnableFrontendStack
+    - 'true'
+  CreateStaticPageCondition: !Equals
+    - !Ref CreateStaticWebpage
+    - 'true'
+  EnableChatUsageStackCondition: !Equals
+    - !Ref EnableChatUsageStack
+    - 'true'
+
+Resources:
+  SolutionSourceBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+
+  CopyArtifactsLambdaIamRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                Resource: !Sub 'arn:aws:s3:::${SolutionSourceBucket}/*'
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                Resource: !Sub 'arn:aws:s3:::aws-contact-center-blog/*'
+              - Effect: Allow
+                Action:
+                  - 's3:ListBucket'
+                  - 's3:ListBucketVersions'
+                Resource: 
+                  - !Sub 'arn:aws:s3:::aws-contact-center-blog/*'
+                  - !Sub 'arn:aws:s3:::${SolutionSourceBucket}/*'
+      ManagedPolicyArns: 
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+
+
+  CustomResourceCopySourceFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Role: !GetAtt CopyArtifactsLambdaIamRole.Arn
+      Handler: "index.handler"
+      Runtime: "nodejs12.x"
+      Code:
+        ZipFile: |
+          const s3 = new (require('aws-sdk')).S3();
+          const response = require('cfn-response');
+          const sourceBucket = 'aws-contact-center-blog';
+          const sourcePrefix = 'usage-analytics';
+          const sourceObjectArray = ['backend.yaml','frontend.yaml','chatusage.yaml'];
+          exports.handler = async (event, context) => {
+              var result = {responseStatus: 'FAILED', responseData: {Data: 'Never updated'}};
+              try {
+                  console.log(`Received event with type ${event.RequestType}`); 
+                  if(event.RequestType === 'Create' || event.RequestType === 'Update') {
+                      copyResult = await Promise.all(
+                          sourceObjectArray.map( async (object) => {
+                              s3Result = await s3.copyObject({
+                                  Bucket: event.ResourceProperties.SolutionSourceBucket,
+                                  Key: object,
+                                  CopySource: `${sourceBucket}/${sourcePrefix}/${object}`
+                              }).promise();
+                              console.log(`Finished uploading File with result ${JSON.stringify(s3Result, 0, 4)}`);
+                          }),
+                      );
+                      result.responseStatus = 'SUCCESS';
+                      result.responseData['Data'] = 'Successfully uploaded files';
+                  } else if (event.RequestType === 'Delete') {
+                      result.responseStatus = 'SUCCESS',
+                      result.responseData['Data'] = 'Successfully deleted files';
+                  }
+              } catch (error) {
+                  console.log(JSON.stringify(error, 0, 4));
+                  result.responseStatus = 'FAILED';
+                  result.responseData['Data'] = 'Failed to process event';
+              } finally {
+                  return await responsePromise(event, context, result.responseStatus, result.responseData, `mainstack`);
+              }
+          };
+
+          function responsePromise(event, context, responseStatus, responseData, physicalResourceId) {
+              return new Promise(() => response.send(event, context, responseStatus, responseData, physicalResourceId));
+          }
+      Timeout: 50
+
+  CopyCfnStacksLambdaTrigger:
+    Type: 'Custom::CopyCfnStacksLambdaTrigger'
+    DependsOn: 
+      - CustomResourceCopySourceFunction
+    Properties:
+      ServiceToken: !GetAtt CustomResourceCopySourceFunction.Arn
+      RequestToken: ${ClientRequestToken}
+      SolutionSourceBucket: !Ref SolutionSourceBucket
+
+  FrontendStack:
+    Condition: EnableFrontendStackCondition
+    Type: AWS::CloudFormation::Stack
+    DependsOn: 
+      - CopyCfnStacksLambdaTrigger
+      - BackendStack
+    Properties:
+      TemplateURL: !Sub 'https://${SolutionSourceBucket}.s3.amazonaws.com/frontend.yaml'
+      Parameters:
+        ConnectionDataBucket: !Ref ConnectionDataBucket
+        CcpUrl: !Ref CcpUrl
+        SamlUrl: !Ref SamlUrl
+        CreateStaticWebpage: !Ref CreateStaticWebpage
+        ConnectGlueDatabase:
+          Fn::GetAtt: 
+            - BackendStack
+            - Outputs.glueCatelog
+
+  ChatUsageStack:
+    Condition: EnableChatUsageStackCondition
+    Type: AWS::CloudFormation::Stack
+    DependsOn: 
+      - CopyCfnStacksLambdaTrigger
+      - BackendStack
+    Properties:
+      TemplateURL: !Sub 'https://${SolutionSourceBucket}.s3.amazonaws.com/chatusage.yaml'
+      Parameters:
+        ConnectChatTranscriptBucket: !Ref ConnectChatTranscriptBucket
+        TranscriptBucketPrefix: !Ref TranscriptBucketPrefix
+        ConnectGlueDatabase:
+          Fn::GetAtt: 
+            - BackendStack
+            - Outputs.glueCatelog
+
+  BackendStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: 
+      - CopyCfnStacksLambdaTrigger
+    Properties:
+      TemplateURL: !Sub 'https://${SolutionSourceBucket}.s3.amazonaws.com/backend.yaml'
+      Parameters:
+        storageDestinationS3: !Ref storageDestinationS3
+
+Outputs:
+  NeedManualConfigNotification:
+    Description: If this value is True, please manually configure the notification based on the guide here...
+    Condition: EnableChatUsageStackCondition
+    Value: 
+      Fn::GetAtt: 
+        - ChatUsageStack
+        - Outputs.NeedManualConfigNotification
+
+  CloudfrontUrl:
+    Description: This is the Url for the custom CCP, please configure this Url in your Amazon Connect application integration. 
+    Condition: CreateStaticPageCondition
+    Value: 
+      Fn::GetAtt: 
+        - FrontendStack
+        - Outputs.CloudfrontDistributionURL
+
+  CTRKinesisFirehose:
+    Description: The ARN of the Kinesis Firehose that will receive CTR events.  Manual configuration required in the Amazon Connect admin -> Data Streaming section.Topic.
+    Value: 
+      Fn::GetAtt: 
+        - BackendStack
+        - Outputs.CTRKinesisFirehose
+
+  CtrOnlyUsageReportNamedQuery:
+    Description:  Creates Athena query for analyzing call usage based on only the CTR data.
+    Value: 
+      Fn::GetAtt: 
+        - BackendStack
+        - Outputs.CtrOnlyUsageReportNamedQuery
+
+  ContactTraceRecordsAthenaNamedQuery:
+    Description: Creates Athena table for CTRs for analysis.
+    Value: 
+      Fn::GetAtt: 
+        - BackendStack
+        - Outputs.ContactTraceRecordsAthenaNamedQuery
+
+  CallConnectionsDataNamedQuery:
+    Description: Creates Athena table for call connections for analysis.
+    Condition: EnableFrontendStackCondition
+    Value: 
+      Fn::GetAtt: 
+        - FrontendStack
+        - Outputs.CallConnectionsDataNamedQuery
+
+  ChatDetailsAthenaNamedQuery:
+    Description: Creates Athena table for chat transcript details.
+    Condition: EnableChatUsageStackCondition
+    Value: 
+      Fn::GetAtt: 
+        - ChatUsageStack
+        - Outputs.ChatDetailsAthenaNamedQuery
+
+  ChatUsageReportAthenaNamedQuery:
+    Description: Creates Athena query for chat usage analytics report
+    Condition: EnableChatUsageStackCondition
+    Value: 
+      Fn::GetAtt: 
+        - ChatUsageStack
+        - Outputs.ChatUsageReportAthenaNamedQuery
+
+  UsageReportAthenaNamedQuery:
+    Condition: EnableFrontendStackCondition
+    Description: Creates Athena query for analyzing call times and phone type for usage analytics.
+    Value: 
+      Fn::GetAtt: 
+        - FrontendStack
+        - Outputs.UsageReportAthenaNamedQuery
