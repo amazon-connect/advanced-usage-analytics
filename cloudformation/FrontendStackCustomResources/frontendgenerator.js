@@ -5,7 +5,7 @@ const s3 = new (require('aws-sdk')).S3();
 const response = require('cfn-response');
 const streamsHtmlKey = 'index.html';
 const sourceBucket = 'aws-contact-center-blog';
-const sourcePrefix = 'connect-diagnostics-customCCP';
+const sourcePrefix = 'usage-analytics';
 const sourceObjectArray = ['connect-ccp-metric-worker.js','connect-streams-min.js','main.js','libphonenumber-js.min.js'];
 exports.handler = async (event, context) => {
     let HtmlFile = [

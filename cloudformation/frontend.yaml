@@ -362,6 +362,13 @@ Resources:
     Type: 'AWS::S3::Bucket'
     DeletionPolicy: Retain
       #Need to upload files
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
 
   CFReadPolicy:
     Condition: CreateStaticPageCondition

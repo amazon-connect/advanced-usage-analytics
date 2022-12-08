@@ -214,7 +214,7 @@ Resources:
           const response = require('cfn-response');
           const streamsHtmlKey = 'index.html';
           const sourceBucket = 'aws-contact-center-blog';
-          const sourcePrefix = 'connect-diagnostics-customCCP';
+          const sourcePrefix = 'usage-analytics';
           const sourceObjectArray = ['connect-ccp-metric-worker.js','connect-streams-min.js','main.js','libphonenumber-js.min.js'];
           exports.handler = async (event, context) => {
               let HtmlFile = [
@@ -311,6 +311,13 @@ Resources:
   WebHostingS3Bucket:
     Type: 'AWS::S3::Bucket'
       #Need to upload files
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
 
   CFReadPolicy:
     Type: 'AWS::S3::BucketPolicy'

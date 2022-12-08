@@ -58,7 +58,7 @@ Resources:
 
       Handler: index.lambda_handler
       Role: !GetAtt LambdaIAMRole.Arn
-      Runtime: python3.6
+      Runtime: python3.9
       Timeout: 5
 
   LambdaInvokePermission:
@@ -192,7 +192,7 @@ Resources:
                 #     NotificationConfiguration={}
                 # )
                 print("Please delete notification manually....")
-      Runtime: python3.6
+      Runtime: python3.9
       Timeout: 50
 
   LambdaTrigger:
